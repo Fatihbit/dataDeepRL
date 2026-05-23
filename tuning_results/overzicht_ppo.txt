@@ -1,0 +1,46 @@
+============================================================
+  HYPERPARAMETER TUNING OVERZICHT — PPO
+  2026-03-25 19:43
+============================================================
+
+Trials voltooid:  7
+Trials gepruned:  13
+Steps per trial:  50,000 (adaptive)
+
+------------------------------------------------------------
+  BESTE TRIAL (#2)
+------------------------------------------------------------
+  Score: 0.1010
+
+  Hyperparameters:
+    learning_rate        = 0.000044
+    gamma                = 0.979308
+    gae_lambda           = 0.987486
+    clip_range           = 0.189102
+    value_coef           = 0.256291
+    entropy_coef         = 0.002940
+    n_epochs             = 14
+    batch_size           = 32
+    deeplob_hidden       = 128
+    deeplob_lstm         = 64
+    hidden_dim           = 256
+
+------------------------------------------------------------
+  ALLE TRIALS (gesorteerd op score)
+------------------------------------------------------------
+  # 2  Score: +0.1010  lr=0.000044  gamma=0.9793  batch=32 <-- BEST
+  # 0  Score: -0.0041  lr=0.000021  gamma=0.9529  batch=128
+  #16  Score: -0.0072  lr=0.000019  gamma=0.9803  batch=64
+  # 3  Score: -0.0301  lr=0.000803  gamma=0.9727  batch=64
+  # 4  Score: -0.0335  lr=0.000072  gamma=0.9734  batch=128
+  #15  Score: -0.0499  lr=0.000111  gamma=0.9662  batch=32
+  # 1  Score: -0.0710  lr=0.000012  gamma=0.9619  batch=128
+
+------------------------------------------------------------
+  GEBRUIK DEZE PARAMS
+------------------------------------------------------------
+  python train/train_sac_only.py --adaptive --total_steps 500000 \
+    --learning_rate 4.413406556107395e-05 \
+    --gamma 0.9793081684002478 \
+    --batch_size 32 \
+    --hidden_dims 256 256

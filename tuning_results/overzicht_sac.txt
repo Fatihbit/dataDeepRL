@@ -1,0 +1,47 @@
+============================================================
+  HYPERPARAMETER TUNING OVERZICHT — SAC
+  2026-03-27 12:16
+============================================================
+
+Trials voltooid:  8
+Trials gepruned:  12
+Steps per trial:  50,000 (adaptive)
+
+------------------------------------------------------------
+  BESTE TRIAL (#12)
+------------------------------------------------------------
+  Score: 0.0094
+
+  Hyperparameters:
+    learning_rate        = 0.000074
+    gamma                = 0.981068
+    tau                  = 0.009710
+    alpha                = 0.386024
+    batch_size           = 512
+    update_every         = 4
+    deeplob_hidden       = 32
+    deeplob_lstm         = 64
+    hidden_dim           = 128
+
+------------------------------------------------------------
+  ALLE TRIALS (gesorteerd op score)
+------------------------------------------------------------
+  #12  Score: +0.0094  lr=0.000074  gamma=0.9811  batch=512 <-- BEST
+  # 4  Score: -0.0035  lr=0.000060  gamma=0.9785  batch=512
+  # 0  Score: -0.0360  lr=0.000114  gamma=0.9879  batch=512
+  # 1  Score: -0.0486  lr=0.000396  gamma=0.9542  batch=64
+  # 2  Score: -0.0694  lr=0.000317  gamma=0.9872  batch=128
+  # 7  Score: -0.0700  lr=0.000012  gamma=0.9629  batch=128
+  #15  Score: -0.0743  lr=0.000077  gamma=0.9693  batch=512
+  # 3  Score: -0.1123  lr=0.000034  gamma=0.9749  batch=128
+
+------------------------------------------------------------
+  GEBRUIK DEZE PARAMS
+------------------------------------------------------------
+  python train/train_sac_only.py --adaptive --total_steps 500000 \
+    --learning_rate 7.359661913105756e-05 \
+    --gamma 0.9810677431117201 \
+    --tau 0.009709895639776197 \
+    --alpha 0.3860244983217799 \
+    --batch_size 512 \
+    --hidden_dims 128 128

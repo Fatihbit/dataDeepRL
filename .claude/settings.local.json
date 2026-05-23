@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -c \":*)",
+      "Bash(python train/train_ppo_only.py --total_steps 999999999 --data_dir ./coreData)"
+    ]
+  }
+}
