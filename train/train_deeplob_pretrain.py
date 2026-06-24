@@ -93,7 +93,6 @@ from tqdm import tqdm
 # Voeg src toe aan path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.dataloader import BTCDataLoader
 from src.models.deeplob import DeepLOB
 from src.utils.logger import TrainingLogger, setup_logging
 
@@ -635,132 +634,81 @@ def main():
     # DATA LOADING
     # =====================================
     print("Loading data...")
-    
-    # Detecteer modus: coreData (pre-split) of raw btc_l2_data
+    import pyarrow.parquet as pq
+
     train_parquet = os.path.join(args.data_dir, 'train.parquet')
-    is_coredata = os.path.exists(train_parquet)
-    
-    if is_coredata:
-        # ===== COREDATA MODUS =====
-        # Data is al gepreprocessed, genormaliseerd en gesplitst
-        import pyarrow.parquet as pq
-        
-        print(f"Using pre-processed coreData from {args.data_dir}")
-        
-        # Detecteer feature kolommen (alles behalve timestamp)
-        schema = pq.read_schema(train_parquet)
-        all_feature_cols = [n for n in schema.names if n != 'timestamp']
-        price_col = 'close'
-        
-        # =====================================
-        # FEATURE FILTERING
-        # =====================================
-        # Non-stationaire features (prijsniveaus, moving averages) verschuiven
-        # over de tijd bij z-score normalisatie → distributie mismatch train/val.
-        # Gebruik alleen stationair features voor betrouwbare generalisatie.
-        # NB: return_1s en log_return_1s zijn verwijderd omdat het model er
-        # te sterk op leunt (1-step momentum) en andere features negeert.
-        STATIONARY_FEATURES = [
-            'spread', 'spread_pct', 'buy_ratio',
-            'return_5s', 'return_10s', 'return_30s', 'return_60s',
-            'volatility_10', 'volatility_30', 'volatility_60',
-            'momentum_10', 'momentum_30',
-            'rsi_14', 'volume_ratio', 'order_imbalance'
-        ]
-        
-        if args.feature_set == 'stationary':
-            feature_cols = [c for c in all_feature_cols if c in STATIONARY_FEATURES]
-            dropped = [c for c in all_feature_cols if c not in STATIONARY_FEATURES]
-            print(f"Feature set: stationary ({len(feature_cols)} features)")
-            print(f"  Dropped {len(dropped)} non-stationary: {dropped[:5]}{'...' if len(dropped)>5 else ''}")
-        else:
-            feature_cols = all_feature_cols
-            print(f"Feature set: all ({len(feature_cols)} features)")
-        
-        print(f"Using features: {feature_cols}")
-        print(f"Max rows per split: {args.max_rows:,}")
-        
-        def load_split_data(parquet_path, max_rows, feature_cols, price_col):
-            """Laad een split als platte features + prijzen, memory-efficient."""
-            pf = pq.ParquetFile(parquet_path)
-            total_rows = pf.metadata.num_rows
-            
-            # Zorg dat price_col altijd geladen wordt (ook als niet in feature_cols)
-            load_cols = list(dict.fromkeys(feature_cols + [price_col]))
-            
-            if total_rows <= max_rows:
-                df = pf.read(columns=load_cols).to_pandas()
-            else:
-                # Lees alleen de laatste row groups die genoeg rijen bevatten
-                num_rg = pf.metadata.num_row_groups
-                rg_rows = [pf.metadata.row_group(i).num_rows for i in range(num_rg)]
-                
-                cumsum = 0
-                start_rg = num_rg
-                for i in range(num_rg - 1, -1, -1):
-                    cumsum += rg_rows[i]
-                    start_rg = i
-                    if cumsum >= max_rows:
-                        break
-                
-                import pyarrow as pa
-                tables = [pf.read_row_group(i, columns=load_cols) for i in range(start_rg, num_rg)]
-                df = pa.concat_tables(tables).to_pandas()
-                del tables
-                df = df.tail(max_rows).reset_index(drop=True)
-            
-            print(f"  Loaded {len(df):,} / {total_rows:,} rows from {os.path.basename(parquet_path)}")
-            
-            features = df[feature_cols].values.astype(np.float32)
-            prices = df[price_col].values.astype(np.float64)
-            del df
-            return features, prices
-        
-        train_features, train_prices = load_split_data(
-            train_parquet, args.max_rows, feature_cols, price_col
+    if not os.path.exists(train_parquet):
+        raise FileNotFoundError(
+            f"coreData niet gevonden in {args.data_dir}. "
+            f"Voer eerst preprocess_data.py + create_core_data.py uit."
         )
-        val_features, val_prices = load_split_data(
-            os.path.join(args.data_dir, 'val.parquet'), 
-            args.max_rows // 4, feature_cols, price_col
-        )
-        test_features, test_prices = load_split_data(
-            os.path.join(args.data_dir, 'test.parquet'),
-            args.max_rows // 4, feature_cols, price_col
-        )
-        
-        input_dim = len(feature_cols)
+
+    print(f"Using pre-processed coreData from {args.data_dir}")
+    schema = pq.read_schema(train_parquet)
+    all_feature_cols = [n for n in schema.names if n != 'timestamp']
+    price_col = 'close'
+
+    # Non-stationary features (price levels, moving averages) drift across
+    # train/val under z-score normalisation. Stationary set generalises better.
+    STATIONARY_FEATURES = [
+        'spread', 'spread_pct', 'buy_ratio',
+        'return_5s', 'return_10s', 'return_30s', 'return_60s',
+        'volatility_10', 'volatility_30', 'volatility_60',
+        'momentum_10', 'momentum_30',
+        'rsi_14', 'volume_ratio', 'order_imbalance',
+    ]
+
+    if args.feature_set == 'stationary':
+        feature_cols = [c for c in all_feature_cols if c in STATIONARY_FEATURES]
+        dropped = [c for c in all_feature_cols if c not in STATIONARY_FEATURES]
+        print(f"Feature set: stationary ({len(feature_cols)} features)")
+        print(f"  Dropped {len(dropped)} non-stationary: {dropped[:5]}{'...' if len(dropped)>5 else ''}")
     else:
-        # ===== RAW DATA MODUS =====
-        # Gebruik BTCDataLoader voor onbewerkte btc_l2_data bestanden
-        print(f"Using raw data from {args.data_dir}")
-        
-        data_loader = BTCDataLoader(
-            data_dir=args.data_dir,
-            window_size=args.sequence_length,
-        )
-        
-        df = data_loader.load_data(max_files=args.max_files)
-        if df is None or len(df) == 0:
-            print("Error: Could not load data!")
-            return
-        
-        df = data_loader.create_features()
-        feature_cols = data_loader.get_feature_columns()
-        
-        # Split het dataframe direct (nog geen sequences)
-        n = len(data_loader.df)
-        train_end = int(n * 0.7)
-        val_end = int(n * 0.85)
-        
-        price_col = 'close'
-        train_features = data_loader.df[feature_cols].values[:train_end].astype(np.float32)
-        train_prices = data_loader.df[price_col].values[:train_end].astype(np.float64)
-        val_features = data_loader.df[feature_cols].values[train_end:val_end].astype(np.float32)
-        val_prices = data_loader.df[price_col].values[train_end:val_end].astype(np.float64)
-        test_features = data_loader.df[feature_cols].values[val_end:].astype(np.float32)
-        test_prices = data_loader.df[price_col].values[val_end:].astype(np.float64)
-        
-        input_dim = len(feature_cols)
+        feature_cols = all_feature_cols
+        print(f"Feature set: all ({len(feature_cols)} features)")
+
+    print(f"Using features: {feature_cols}")
+    print(f"Max rows per split: {args.max_rows:,}")
+
+    def load_split_data(parquet_path, max_rows, feature_cols, price_col):
+        pf = pq.ParquetFile(parquet_path)
+        total_rows = pf.metadata.num_rows
+        load_cols = list(dict.fromkeys(feature_cols + [price_col]))
+
+        if total_rows <= max_rows:
+            df = pf.read(columns=load_cols).to_pandas()
+        else:
+            num_rg = pf.metadata.num_row_groups
+            rg_rows = [pf.metadata.row_group(i).num_rows for i in range(num_rg)]
+            cumsum = 0
+            start_rg = num_rg
+            for i in range(num_rg - 1, -1, -1):
+                cumsum += rg_rows[i]
+                start_rg = i
+                if cumsum >= max_rows:
+                    break
+            import pyarrow as pa
+            tables = [pf.read_row_group(i, columns=load_cols) for i in range(start_rg, num_rg)]
+            df = pa.concat_tables(tables).to_pandas()
+            del tables
+            df = df.tail(max_rows).reset_index(drop=True)
+
+        print(f"  Loaded {len(df):,} / {total_rows:,} rows from {os.path.basename(parquet_path)}")
+        features = df[feature_cols].values.astype(np.float32)
+        prices = df[price_col].values.astype(np.float64)
+        del df
+        return features, prices
+
+    train_features, train_prices = load_split_data(
+        train_parquet, args.max_rows, feature_cols, price_col)
+    val_features, val_prices = load_split_data(
+        os.path.join(args.data_dir, 'val.parquet'),
+        args.max_rows // 4, feature_cols, price_col)
+    test_features, test_prices = load_split_data(
+        os.path.join(args.data_dir, 'test.parquet'),
+        args.max_rows // 4, feature_cols, price_col)
+
+    input_dim = len(feature_cols)
     
     print(f"\nData loaded:")
     print(f"  Train: {len(train_features):,} rows")

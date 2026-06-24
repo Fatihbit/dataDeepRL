@@ -30,5 +30,8 @@ optuna>=3.0.0
 # Utilities
 pyyaml>=6.0
 
+# Testing & coverage (ontwikkelstraat)
+coverage>=7.0
+
 # Optional: For faster training
 # cupy-cuda11x  # GPU accelerated numpy (if using CUDA 11.x)

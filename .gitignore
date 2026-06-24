@@ -38,6 +38,12 @@ ENV/
 # Jupyter
 .ipynb_checkpoints/
 
+# Test / coverage artefacten
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
 # Data (large files)
 btc_l2_data/
 *.parquet

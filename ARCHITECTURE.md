@@ -1,540 +1,300 @@
-# DataDeepRL Architectuur Documentatie
+# Software Architectuur — DataDeepRL
 
-## Overzicht
+## 1. Overzicht
 
-DataDeepRL is een reinforcement learning framework voor cryptocurrency trading met Bitcoin (BTC) order book data. Het project combineert deep learning feature extraction (DeepLOB) met state-of-the-art RL algoritmes (PPO en SAC).
+DataDeepRL is een Deep Reinforcement Learning framework voor cryptocurrency trading.
+Het systeem combineert een **DeepLOB feature extractor** (CNN + Inception + BiLSTM)
+met **PPO** en **SAC** RL-agenten om handelsbeslissingen te nemen op basis van
+Binance BTC/USDT L2 order book data.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     DATAFLOW ARCHITECTUUR                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐  │
-│  │  Binance L2   │───>│  DataLoader  │───>│  Trading Env     │  │
-│  │  Order Book   │    │  (Sequences) │    │  (Gymnasium)     │  │
-│  └──────────────┘    └──────────────┘    └────────┬─────────┘  │
-│                                                   │             │
-│                                                   ▼             │
-│                           ┌─────────────────────────────────┐   │
-│                           │         RL AGENT                │   │
-│                           │  ┌─────────────────────────┐    │   │
-│                           │  │      DeepLOB            │    │   │
-│                           │  │  (Feature Extractor)    │    │   │
-│                           │  │  CNN + LSTM + Attention │    │   │
-│                           │  └────────────┬────────────┘    │   │
-│                           │               │                  │   │
-│                           │               ▼                  │   │
-│                           │  ┌─────────────────────────┐    │   │
-│                           │  │   PPO / SAC Networks    │    │   │
-│                           │  │  Policy + Value/Critic  │    │   │
-│                           │  └─────────────────────────┘    │   │
-│                           └─────────────────────────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+---
+
+## 2. Systeemoverzicht
+
+```mermaid
+flowchart TD
+    subgraph DATAPIPELINE["📦 Datapipeline (eenmalig)"]
+        A[Binance API] -->|aggTrades per dag| B[binance_l2.py]
+        B --> C[(btc_l2_data/\n.parquet per dag)]
+        C --> D[preprocess_data.py\nfeature engineering + z-score]
+        D --> E[(DataNorm/\ngenormaliseerde features)]
+        E --> F[create_core_data.py\n80/10/10 split]
+        F --> G[(coreData/\ntrain · val · test\n+ normalization_stats.json)]
+    end
+
+    subgraph TRAINING["🧠 Training"]
+        G -->|load_coredata_streaming| H[CryptoTradingEnv]
+        H -->|obs, reward, done| I{Agent}
+        I -->|PPO + DeepLOB| J[train_ppo_with_deeplob.py]
+        I -->|SAC + DeepLOB| K[train_sac_with_deeplob.py]
+        I -->|PPO + MLP| L[train_ppo_only.py]
+        I -->|SAC + MLP| M[train_sac_only.py]
+        J & K & L & M --> N[(logs/\nbest_model.pt\ntraining_monitor.csv)]
+    end
+
+    subgraph EVALUATIE["📊 Evaluatie"]
+        N --> O[evaluate.py]
+        G -->|test.parquet| O
+        O --> P[Sharpe · Drawdown · Return\nComposite Score\nBuy-and-Hold vergelijking]
+    end
 ```
 
 ---
 
-## Project Structuur
+## 3. Datapipeline
+
+```mermaid
+flowchart LR
+    RAW["btc_l2_data/\n(ruwe parquet)"]
+    NORM["DataNorm/\n(z-score features)"]
+    CORE["coreData/"]
+
+    RAW -->|"feature engineering\nper maand chunk"| NORM
+    NORM -->|"chronologische split"| CORE
+
+    CORE --> TR["train.parquet\n80%"]
+    CORE --> VA["val.parquet\n10%"]
+    CORE --> TE["test.parquet\n10%"]
+    CORE --> ST["normalization_stats.json"]
+```
+
+**Features (15 stuks — `STATIONARY_FEATURES`):**
+
+| Categorie | Features |
+|---|---|
+| Spread | `spread`, `spread_pct` |
+| Order flow | `buy_ratio`, `order_imbalance`, `volume_ratio` |
+| Returns | `return_5s`, `return_10s`, `return_30s`, `return_60s` |
+| Volatiliteit | `volatility_10`, `volatility_30`, `volatility_60` |
+| Momentum | `momentum_10`, `momentum_30` |
+| Technisch | `rsi_14` |
+
+---
+
+## 4. DeepLOB Architectuur
+
+```mermaid
+flowchart TD
+    IN["Input\n(batch × window_size × 15 features)"]
+
+    IN --> CB1
+    CB1["ConvBlock 1\nConv1D → BatchNorm → LeakyReLU"]
+    CB1 --> CB2
+    CB2["ConvBlock 2\nConv1D → BatchNorm → LeakyReLU"]
+    CB2 --> INC
+
+    subgraph INC["Inception Module (multi-scale)"]
+        direction LR
+        P1["Conv 1×1"]
+        P2["Conv 3×3"]
+        P3["Conv 5×5"]
+    end
+
+    INC -->|concat| LSTM
+    LSTM["BiLSTM\nbidirectionele LSTM\ntemporele afhankelijkheden"]
+    LSTM --> ATT
+    ATT["Attention Pooling\ngewogen gemiddelde\nover tijdsdimensie"]
+    ATT --> OUT
+
+    subgraph PRETRAIN["Pretraining (supervised)"]
+        OUT["Feature vector\n(feature_dim,)"]
+        OUT -->|CrossEntropyLoss| CLS["Classificatie\nomhoog / vlak / omlaag"]
+    end
+
+    OUT -->|bevroren gewichten| RL["RL Agent backbone"]
+```
+
+> Na pretraining worden de gewichten **bevroren** (`--freeze_deeplob`).
+> De DeepLOB fungeert daarna puur als feature extractor voor de RL-agent.
+
+---
+
+## 5. RL Agent — Beslissingslus
+
+```mermaid
+sequenceDiagram
+    participant E as CryptoTradingEnv
+    participant A as RL Agent (PPO/SAC)
+    participant D as DeepLOB (optioneel)
+    participant B as Buffer
+
+    loop Elke tijdstap
+        E->>A: obs {features (100×15), portfolio (3,)}
+        A->>D: features window
+        D->>A: feature vector
+        A->>E: actie (Hold / Buy / Sell)
+        E->>A: reward + volgende obs + done
+        A->>B: sla transitie op
+    end
+
+    Note over A,B: PPO: RolloutBuffer → update na N stappen (on-policy)
+    Note over A,B: SAC: ReplayBuffer → update per stap (off-policy)
+```
+
+---
+
+## 6. PPO vs SAC — Algoritme vergelijking
+
+```mermaid
+flowchart LR
+    subgraph PPO["PPO (On-policy)"]
+        direction TB
+        P1["Verzamel rollout\n(N stappen)"]
+        P2["Bereken GAE-voordelen"]
+        P3["Update policy\nmeerdere epochs\n— clipped surrogate loss\n— value loss\n— entropy bonus"]
+        P4["Gooi data weg"]
+        P1 --> P2 --> P3 --> P4 --> P1
+    end
+
+    subgraph SAC["SAC (Off-policy)"]
+        direction TB
+        S1["Voer stap uit\nmet actor"]
+        S2["Sla op in\nReplay Buffer"]
+        S3["Sample random\nbatch"]
+        S4["Update Twin Q-networks\n+ Actor\n+ temperatuur α"]
+        S1 --> S2 --> S3 --> S4 --> S1
+    end
+```
+
+| | PPO | SAC |
+|---|---|---|
+| Type | On-policy | Off-policy |
+| Buffer | RolloutBuffer (weggooi) | ReplayBuffer (bewaar) |
+| Sample efficiency | Lager | Hoger |
+| Stabiliteit | Hoog | Hoog |
+| Exploratie | Entropy bonus | Maximum entropy principe |
+
+---
+
+## 7. Trainingsflow
+
+```mermaid
+sequenceDiagram
+    participant TR as train.parquet
+    participant VA as val.parquet
+    participant AG as RL Agent
+    participant CK as best_model.pt
+
+    Note over TR,CK: Stap 1 — Pretrain DeepLOB (supervised)
+    TR->>AG: batches prijsrichting labels
+    VA->>AG: val_loss (early stopping)
+    AG->>CK: sla op als deeplob_pretrained.pt
+
+    Note over TR,CK: Stap 2 — RL Training
+    loop Elke update
+        TR->>AG: stream van marktdata
+        AG->>AG: trade, collect reward
+    end
+
+    loop Elke eval_freq stappen
+        VA->>AG: evalueer N episodes
+        AG->>AG: bereken composite_score
+        AG-->>CK: sla op als beste score beter is
+    end
+
+    Note over TR,CK: Stap 3 — Eindoordeel (evaluate.py)
+    Note over TR,CK: test.parquet (nooit eerder gezien)
+```
+
+---
+
+## 8. Data-splitsing en rol per fase
+
+```mermaid
+gantt
+    title Dataset gebruik per fase
+    dateFormat X
+    axisFormat %s%%
+
+    section train.parquet (80%)
+    RL agent leert strategie       :0, 80
+
+    section val.parquet (10%)
+    Checkpoint selectie tijdens training :80, 90
+
+    section test.parquet (10%)
+    Eerlijk eindoordeel (scriptie) :90, 100
+```
+
+> **Testdata wordt nooit gebruikt tijdens training of modelkeuze.**
+> Alleen de testsplit geeft een onbevooroordeeld eindresultaat voor de scriptie.
+
+---
+
+## 9. Evaluatiemetrieken
+
+```mermaid
+flowchart TD
+    M[evaluate.py\nbest_model.pt + test.parquet]
+
+    M --> SR["Sharpe Ratio\nrisicogecorrigeerd rendement\nSharpe > 1 = goed"]
+    M --> MD["Max Drawdown\nmaximale piekdaling\nlager = beter"]
+    M --> RT["Total Return %\nprocentuele eindwinst/-verlies"]
+    M --> PL["Total Profit / Total Loss\nsom winnende vs verliezende trades"]
+    M --> CS["Composite Score\n0.5 × clip(Sharpe,-5,5)/5\n+ 0.5 × clip(Return,-1,1)\n− 0.2 × Drawdown"]
+    M --> BH["Buy-and-Hold Benchmark\npassieve strategie ter vergelijking"]
+
+    CS -->|"hogere score = beter model"| VERDICT[Eindoordeel]
+    BH --> VERDICT
+```
+
+---
+
+## 10. Ontwerpkeuzes
+
+| Keuze | Motivatie |
+|---|---|
+| Gesplitste trainingsscripts per variant | Expliciete controle; geen hidden flags; eenvoudiger debuggen |
+| Bevroren DeepLOB tijdens RL-training | Voorkomt dat RL de feature-representaties overschrijft; stabielere training |
+| On-the-fly windowing in de env | Vermijdt materialisatie van een (N × seq_len × features) array; past in RAM |
+| Z-score normalisatie in preprocessing | Stationariteit; vereist door LSTM-gebaseerde modellen |
+| Composite score als checkpoint-criterium | Balanceert Sharpe, return én drawdown in één getal voor modelselectie |
+| Chronologische split (geen random) | Voorkomt data leakage; respecteert temporele afhankelijkheid van financiële tijdreeksen |
+| Inception module (multi-scale conv) | Vangt patronen op korte én lange tijdschalen tegelijk op in het LOB |
+| BiLSTM i.p.v. LSTM | Ziet zowel de vorige als de komende context; betere representatie |
+
+---
+
+## 11. Mappenstructuur
 
 ```
 dataDeepRL/
-├── src/                        # Broncode
-│   ├── data/                   # Data laden en verwerken
-│   │   └── dataloader.py       # BTCDataLoader voor order book data
-│   │
-│   ├── envs/                   # Gymnasium environments
-│   │   └── trading_env.py      # CryptoTradingEnv voor RL training
-│   │
-│   ├── models/                 # Neural network modellen
-│   │   ├── deeplob.py          # DeepLOB feature extractor
-│   │   ├── mlp.py              # MLP networks voor PPO/SAC
-│   │   ├── ppo.py              # PPO agent implementatie
-│   │   └── sac.py              # SAC agent implementatie
-│   │
-│   └── utils/                  # Utility modules
-│       ├── callbacks.py        # Training callbacks
-│       ├── logger.py           # Training logger
-│       └── mixed_precision.py  # AMP training support
+├── btc_l2_data/            Ruwe Binance L2 parquet (per dag)
+├── coreData/               Genormaliseerde train/val/test + normalization_stats.json
+├── models/                 Opgeslagen modellen (deeplob_pretrained.pt)
+├── logs/                   TensorBoard runs + training_monitor.csv per run
 │
-├── train/                      # Training scripts
-│   ├── common/                 # Gedeelde training utilities
-│   │   ├── args.py             # Argument parsers
-│   │   └── setup.py            # Setup functies
-│   │
-│   ├── train_ppo_deeplob.py    # PPO + DeepLOB training
-│   ├── train_sac_deeplob.py    # SAC + DeepLOB training
-│   └── ...                     # Overige training scripts
+├── src/
+│   ├── envs/
+│   │   ├── trading_env.py  CryptoTradingEnv + FlatCryptoTradingEnv
+│   │   └── vec_env.py      VectorizedTradingEnv (N parallelle subprocessen)
+│   ├── models/
+│   │   ├── deeplob.py      DeepLOB (ConvBlock, Inception, BiLSTM, Attention)
+│   │   ├── mlp.py          MLP netwerken (policy, value, actor, critic)
+│   │   ├── ppo.py          PPOAgent + RolloutBuffer
+│   │   └── sac.py          SACAgent + ReplayBuffer
+│   └── utils/
+│       ├── logger.py       Training logger
+│       ├── callbacks.py    Eval callbacks
+│       ├── trade_logger.py Trade-level logging
+│       └── mixed_precision.py  AMP support
 │
-├── configs/                    # YAML configuratie bestanden
-│   └── default.yaml            # Default hyperparameters
+├── train/
+│   ├── common/
+│   │   └── setup.py        load_coredata_streaming() + STATIONARY_FEATURES
+│   ├── train_deeplob_pretrain.py
+│   ├── train_ppo_only.py
+│   ├── train_sac_only.py
+│   ├── train_ppo_with_deeplob.py
+│   └── train_sac_with_deeplob.py
 │
-├── btc_l2_data/               # Data directory (niet in git)
-├── logs/                       # Training logs
-├── checkpoints/                # Model checkpoints
+├── dataVerwerken/
+│   ├── preprocess_data.py  Feature engineering + z-score
+│   └── create_core_data.py 80/10/10 split
 │
-├── tune_hyperparams.py         # Optuna hyperparameter tuning
-└── requirements.txt            # Python dependencies
+├── binance_l2.py           Binance download script
+├── evaluate.py             Evalueer model op val/test split
+├── tune.py                 Optuna hyperparameter tuning
+├── ARCHITECTURE.md         Dit document
+└── README.md               Installatie + gebruik
 ```
-
----
-
-## Module Beschrijvingen
-
-### 1. Data Module (`src/data/`)
-
-#### BTCDataLoader (`dataloader.py`)
-
-**Doel**: Laad en prepareer Binance L2 order book data voor training.
-
-**Data Pipeline**:
-```
-Parquet Files ──> Load ──> Feature Engineering ──> Sequences ──> Train/Val/Test Split
-```
-
-**Belangrijke Features**:
-- OHLCV data (Open, High, Low, Close, Volume)
-- Bid/Ask prices en volumes
-- Technische indicatoren (RSI, MACD, ATR, etc.)
-- Order flow imbalance metrics
-
-**Normalisatie**:
-- StandardScaler: `(x - μ) / σ` - waarden rond 0
-- MinMaxScaler: `(x - min) / (max - min)` - waarden 0-1
-
-**Data Split**:
-```
-[========== 70% Train ==========][=== 15% Val ===][=== 15% Test ===]
-                                   ↑
-                      Chronologische split (geen shuffle!)
-```
-
----
-
-### 2. Environment Module (`src/envs/`)
-
-#### CryptoTradingEnv (`trading_env.py`)
-
-**Doel**: Gymnasium environment voor trading simulatie.
-
-**State Space**:
-```python
-observation = {
-    'features': np.array(shape=(window_size, num_features)),  # Market data
-    'portfolio': np.array([balance_ratio, btc_ratio, unrealized_pnl, portfolio_ratio])
-}
-```
-
-**Action Space**:
-- Discrete (default): `{0: Hold, 1: Buy, 2: Sell}`
-- Continue: `[-1.0, +1.0]` waar -1=sell, 0=hold, +1=buy
-
-**Reward Functie**:
-```python
-reward = (portfolio_change_pct * 100 * scaling)    # Basis: PnL
-       - (transaction_fee * 10)                     # Fee penalty
-       - (drawdown_penalty if drawdown > 10%)       # Risk penalty
-```
-
-**Episode Terminatie**:
-- Einde data (`truncated=True`)
-- Failliet: portfolio < 10% van start (`terminated=True`)
-
----
-
-### 3. Models Module (`src/models/`)
-
-#### DeepLOB (`deeplob.py`)
-
-**Doel**: Feature extraction uit order book sequences.
-
-**Architectuur**:
-```
-Input: (batch, window_size, num_features)
-              │
-    ┌─────────▼─────────┐
-    │   Conv1D Block 1   │   Filter: hidden_dim, kernel: 3
-    │   Conv1D Block 2   │   BatchNorm + LeakyReLU
-    │   MaxPool1d (2)    │
-    └─────────┬─────────┘
-              │
-    ┌─────────▼─────────┐
-    │   Conv1D Block 3   │   Filter: hidden_dim * 2
-    │   Conv1D Block 4   │
-    │   MaxPool1d (2)    │
-    └─────────┬─────────┘
-              │
-    ┌─────────▼─────────┐
-    │  Inception Module  │   Multi-scale features (1x1, 3x3, 5x5)
-    │  4 parallel branches│
-    └─────────┬─────────┘
-              │
-    ┌─────────▼─────────┐
-    │   Bidirectional    │   hidden: lstm_hidden
-    │       LSTM         │   Captures temporal dependencies
-    └─────────┬─────────┘
-              │
-    ┌─────────▼─────────┐
-    │   Attention Layer  │   Weighted pooling over time
-    └─────────┬─────────┘
-              │
-    ┌─────────▼─────────┐
-    │   Output FC Layer  │   output_dim features
-    └─────────┴─────────┘
-
-Output: (batch, output_dim)
-```
-
----
-
-#### PPO Agent (`ppo.py`)
-
-**Doel**: On-policy reinforcement learning met clipped surrogate objective.
-
-**Algoritme Overzicht**:
-```
-1. Collect rollout (n_steps transitions)
-2. Compute advantages met GAE
-3. Multiple epochs van mini-batch updates
-4. Clipped policy gradient update
-5. Value function update
-6. Reset buffer, repeat
-```
-
-**Kernconcepten**:
-
-**GAE (Generalized Advantage Estimation)**:
-```
-δ_t = r_t + γV(s_{t+1}) - V(s_t)     # TD error
-A_t = Σ (γλ)^l δ_{t+l}                # GAE
-```
-
-**Clipped Surrogate Loss**:
-```
-r(θ) = π_θ(a|s) / π_θ_old(a|s)        # Probability ratio
-L_CLIP = min(r(θ)A, clip(r(θ), 1-ε, 1+ε)A)
-```
-
-**Hyperparameters**:
-| Parameter | Default | Beschrijving |
-|-----------|---------|--------------|
-| lr | 3e-4 | Learning rate |
-| gamma | 0.99 | Discount factor |
-| gae_lambda | 0.95 | GAE lambda |
-| clip_range | 0.2 | PPO clip ε |
-| value_coef | 0.5 | Value loss weight |
-| entropy_coef | 0.01 | Entropy bonus |
-| n_epochs | 10 | Updates per rollout |
-
----
-
-#### SAC Agent (`sac.py`)
-
-**Doel**: Off-policy maximum entropy RL.
-
-**Algoritme Overzicht**:
-```
-1. Sample action met actor
-2. Store transition in replay buffer
-3. Sample batch from buffer
-4. Update critics met TD target
-5. Update actor met policy gradient
-6. Update temperature α (auto-tune)
-7. Soft update target networks
-```
-
-**Kernconcepten**:
-
-**Maximum Entropy RL**:
-```
-J(π) = Σ E[r + γV(s') - α·log(π(a|s))]
-```
-Hogere α = meer exploratie door entropy bonus.
-
-**Twin Q-Networks**:
-```
-Q_target = min(Q1, Q2) - α·log(π)    # Prevent overestimation
-```
-
-**Soft Update**:
-```
-θ_target = τ·θ + (1-τ)·θ_target      # Smooth target update
-```
-
-**Hyperparameters**:
-| Parameter | Default | Beschrijving |
-|-----------|---------|--------------|
-| lr | 3e-4 | Learning rate |
-| gamma | 0.99 | Discount factor |
-| tau | 0.005 | Soft update coef |
-| alpha | 0.2 | Initial temperature |
-| auto_alpha | True | Auto-tune α |
-| buffer_size | 1M | Replay buffer capacity |
-| start_steps | 10000 | Random warmup steps |
-
----
-
-### 4. Utils Module (`src/utils/`)
-
-#### TrainingLogger (`logger.py`)
-
-**Features**:
-- Console logging met progress
-- CSV metrics export
-- TensorBoard integration
-- MLflow experiment tracking (optioneel)
-
-**Log Locaties**:
-```
-logs/{experiment_name}/
-├── config.json           # Training configuratie
-├── step_metrics.csv      # Per-step losses
-├── episode_metrics.csv   # Per-episode rewards
-├── tensorboard/          # TensorBoard logs
-├── mlruns/               # MLflow tracking (indien enabled)
-└── checkpoints/          # Model checkpoints
-```
-
-#### Callbacks (`callbacks.py`)
-
-| Callback | Functie |
-|----------|---------|
-| CheckpointCallback | Periodiek model opslaan |
-| EvalCallback | Evaluatie op validation env |
-| EarlyStoppingCallback | Stop bij geen verbetering |
-| LearningRateScheduler | LR schedule (linear/cosine) |
-| ProgressCallback | Progress bar |
-| PauseResumeCallback | Ctrl+C voor pause + checkpoint |
-
----
-
-## Training Flow
-
-### 1. PPO Training Loop
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                     PPO TRAINING LOOP                           │
-├────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────┐                                               │
-│  │  1. Reset   │                                               │
-│  │   Rollout   │                                               │
-│  │   Buffer    │                                               │
-│  └──────┬──────┘                                               │
-│         │                                                       │
-│         ▼                                                       │
-│  ┌─────────────────────────────────────────┐                   │
-│  │  2. Collect Rollout (n_steps)            │◄────┐            │
-│  │     for step in n_steps:                 │     │            │
-│  │       action = agent.select_action(obs)  │     │            │
-│  │       obs', r, done = env.step(action)   │     │            │
-│  │       buffer.add(obs, action, r, done)   │     │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    ▼                              │            │
-│  ┌─────────────────────────────────────────┐     │            │
-│  │  3. Compute Advantages (GAE)             │     │            │
-│  │     returns, advantages = compute_gae()  │     │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    ▼                              │            │
-│  ┌─────────────────────────────────────────┐     │            │
-│  │  4. PPO Update (n_epochs)                │     │            │
-│  │     for epoch in n_epochs:               │     │            │
-│  │       for batch in batches:              │     │            │
-│  │         compute_losses()                 │     │            │
-│  │         optimizer.step()                 │     │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    ▼                              │            │
-│  ┌─────────────────────────────────────────┐     │            │
-│  │  5. Evaluation (periodiek)               │     │            │
-│  │     eval_reward = evaluate(eval_env)     │     │            │
-│  │     if best: save_model()                │     │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    └──────────────────────────────┘            │
-│                                                                 │
-└────────────────────────────────────────────────────────────────┘
-```
-
-### 2. SAC Training Loop
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                     SAC TRAINING LOOP                           │
-├────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────┐                   │
-│  │  1. Warmup Phase (start_steps)           │                  │
-│  │     Random actions to fill buffer        │                  │
-│  └─────────────────┬───────────────────────┘                   │
-│                    │                                            │
-│                    ▼                                            │
-│  ┌─────────────────────────────────────────┐                   │
-│  │  2. Collect Experience                   │◄────┐            │
-│  │     action = agent.select_action(obs)    │     │            │
-│  │     obs', r, done = env.step(action)     │     │            │
-│  │     buffer.add(obs, action, r, obs', done)│    │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    ▼                              │            │
-│  ┌─────────────────────────────────────────┐     │            │
-│  │  3. Sample Batch                         │     │            │
-│  │     batch = buffer.sample(batch_size)    │     │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    ▼                              │            │
-│  ┌─────────────────────────────────────────┐     │            │
-│  │  4. Update Critics                       │     │            │
-│  │     target_Q = r + γ*(min(Q1',Q2')-α*logπ)│    │            │
-│  │     critic_loss = MSE(Q, target_Q)       │     │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    ▼                              │            │
-│  ┌─────────────────────────────────────────┐     │            │
-│  │  5. Update Actor                         │     │            │
-│  │     actor_loss = α*logπ - Q1(s, π(s))    │     │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    ▼                              │            │
-│  ┌─────────────────────────────────────────┐     │            │
-│  │  6. Update Temperature (if auto_alpha)   │     │            │
-│  │     α_loss = -α*(logπ + target_entropy)  │     │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    ▼                              │            │
-│  ┌─────────────────────────────────────────┐     │            │
-│  │  7. Soft Update Targets                  │     │            │
-│  │     θ_target = τ*θ + (1-τ)*θ_target      │     │            │
-│  └─────────────────┬───────────────────────┘     │            │
-│                    │                              │            │
-│                    └──────────────────────────────┘            │
-│                                                                 │
-└────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Hyperparameter Tuning
-
-### Optuna Integratie (`tune_hyperparams.py`)
-
-**Ondersteunde Parameters**:
-```python
-{
-    'learning_rate': [1e-5, 1e-3],      # Log uniform
-    'gamma': [0.9, 0.9999],             # Uniform
-    'batch_size': [32, 64, 128, 256],   # Categorical
-    'hidden_dims': [(64,64), (128,128), (256,256)],
-    'entropy_coef': [0.001, 0.1],       # Log uniform (PPO)
-    'tau': [0.001, 0.01],               # Uniform (SAC)
-}
-```
-
-**Pruning**:
-Optuna stopt slecht presterende trials vroeg via MedianPruner.
-
-**Gebruik**:
-```bash
-python tune_hyperparams.py --algo ppo --n_trials 100 --n_jobs 4
-```
-
----
-
-## Experiment Tracking
-
-### MLflow (Optioneel)
-
-**Enable**:
-```python
-logger = TrainingLogger(..., use_mlflow=True)
-```
-
-**Start UI**:
-```bash
-mlflow ui --backend-store-uri file:///path/to/logs/mlruns
-```
-
-**Getrackte Metrics**:
-- Training losses (actor, critic, value)
-- Episode rewards
-- Evaluation metrics
-- Hyperparameters
-
-### TensorBoard
-
-**Start**:
-```bash
-tensorboard --logdir logs/{experiment}/tensorboard
-```
-
-**Beschikbare Plots**:
-- Loss curves
-- Reward trajectories
-- Learning rate
-- Episode lengths
-
----
-
-## ONNX Export
-
-**Voor Production Inference**:
-```python
-agent.export_onnx('model.onnx')
-
-# Later in productie:
-import onnxruntime as ort
-session = ort.InferenceSession('model.onnx')
-action_probs = session.run(None, {'observation': obs})
-```
-
----
-
-## Best Practices
-
-### 1. Training
-
-1. **Start met kleine dataset** om bugs te vinden
-2. **Monitor TensorBoard** voor training curves
-3. **Gebruik checkpoints** voor lange training runs
-4. **Evalueer regelmatig** op validation set
-5. **Track experiments** met MLflow
-
-### 2. Hyperparameters
-
-1. **Learning rate**: Start met 3e-4, tune indien nodig
-2. **Batch size**: Groter = stabieler, maar langzamer
-3. **Buffer size (SAC)**: Meer = beter off-policy learning
-4. **Entropy coef (PPO)**: Hogere waarde = meer exploratie
-
-### 3. Debugging
-
-1. **Check rewards**: Moeten over tijd stijgen
-2. **Monitor losses**: Value loss moet dalen
-3. **Check action distribution**: Niet te deterministisch vroeg in training
-4. **Visualize trades**: Kijk of agent rationeel handelt
-
----
-
-## Troubleshooting
-
-| Probleem | Mogelijke Oorzaak | Oplossing |
-|----------|-------------------|-----------|
-| Reward stijgt niet | LR te hoog/laag | Tune learning rate |
-| Value loss explodeert | Gradients te groot | Verlaag max_grad_norm |
-| Agent doet niets | Entropy te laag | Verhoog entropy_coef |
-| Out of memory | Batch/buffer te groot | Verklein batch_size |
-| Training onstabiel | Clip range te groot | Verlaag clip_range |
-
----
-
-## Referenties
-
-- [DeepLOB Paper](https://arxiv.org/abs/1905.05514) - Zhang et al., 2019
-- [PPO Paper](https://arxiv.org/abs/1707.06347) - Schulman et al., 2017
-- [SAC Paper](https://arxiv.org/abs/1812.05905) - Haarnoja et al., 2018
-- [Gymnasium Documentation](https://gymnasium.farama.org/)
-- [Optuna Documentation](https://optuna.readthedocs.io/)
-- [MLflow Documentation](https://mlflow.org/docs/latest/index.html)

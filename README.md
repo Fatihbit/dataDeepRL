@@ -1,225 +1,124 @@
-# DataDeepRL - Cryptocurrency Trading met Deep Reinforcement Learning
+# DataDeepRL — Crypto Trading met Deep RL
 
-Dit project implementeert deep reinforcement learning agents voor cryptocurrency trading met BTC/USDT data.
+Deep reinforcement learning agents (PPO / SAC) voor BTC/USDT trading op basis
+van Binance L2 order-book data, met een optionele DeepLOB feature extractor.
 
-## 📁 Project Structuur
+## Projectstructuur
 
 ```
 dataDeepRL/
-├── btc_l2_data/                 # BTC Level 2 order book data
-├── models/                      # Opgeslagen modellen
-├── logs/                        # Training logs en TensorBoard
+├── btc_l2_data/                Ruwe Binance L2 parquet bestanden (per dag)
+├── coreData/                   Genormaliseerde + gesplitste train/val/test data
+├── models/                     Opgeslagen modellen (DeepLOB pretrained etc.)
+├── logs/                       TensorBoard / training runs
+│
 ├── src/
-│   ├── data/
-│   │   └── dataloader.py        # Data loading en feature engineering
 │   ├── envs/
-│   │   └── trading_env.py       # Gymnasium trading environment
+│   │   ├── trading_env.py      Gymnasium trading environment
+│   │   └── vec_env.py          Vectorized env wrapper
 │   ├── models/
-│   │   ├── deeplob.py           # DeepLOB CNN+LSTM architectuur
-│   │   ├── mlp.py               # MLP feature extractors
-│   │   ├── sac.py               # Soft Actor-Critic
-│   │   └── ppo.py               # Proximal Policy Optimization
-│   └── utils/
-│       ├── logger.py            # Logging en TensorBoard
-│       └── callbacks.py         # Training callbacks
+│   │   ├── deeplob.py          DeepLOB (CNN + Inception + BiLSTM + attention)
+│   │   ├── mlp.py              MLP feature extractors
+│   │   ├── ppo.py              PPO agent (MLP)
+│   │   └── sac.py              SAC agent (MLP)
+│   └── utils/                  Logger, callbacks, trade logger, mixed precision
 │
 ├── train/
-│   ├── train_deeplob_pretrain.py # 1️⃣ Pre-train DeepLOB (supervised)
-│   ├── train_sac_with_deeplob.py  # 2️⃣ SAC met pre-trained DeepLOB
-│   ├── train_ppo_with_deeplob.py  # 2️⃣ PPO met pre-trained DeepLOB
-│   ├── train_sac_only.py          # SAC zonder DeepLOB (MLP only)
-│   ├── train_ppo_only.py          # PPO zonder DeepLOB (MLP only)
-│   ├── train_sac_deeplob.py       # SAC + DeepLOB (end-to-end)
-│   └── train_ppo_deeplob.py       # PPO + DeepLOB (end-to-end)
+│   ├── common/setup.py         load_coredata_streaming + STATIONARY_FEATURES
+│   ├── train_deeplob_pretrain.py
+│   ├── train_ppo_only.py        PPO + MLP
+│   ├── train_sac_only.py        SAC + MLP
+│   ├── train_ppo_with_deeplob.py PPO + pretrained DeepLOB
+│   └── train_sac_with_deeplob.py SAC + pretrained DeepLOB
 │
-├── dataVerwerken/                   # Data preprocessing scripts
-│   ├── preprocess_data.py
-│   ├── create_core_data.py
-│   └── parquet_to_csv.py
+├── dataVerwerken/              Data preprocessing pipeline
+│   ├── preprocess_data.py      Feature engineering + z-score normalisatie
+│   └── create_core_data.py     80/10/10 train/val/test split
 │
+├── binance_l2.py               Download script voor Binance aggTrades
+├── evaluate.py                 Evalueer getrainde modellen op val/test
 ├── requirements.txt
 └── README.md
 ```
 
-## 🚀 Quick Start
-
-### 1. Installeer Dependencies
+## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Download/Prepareer Data
+## Data pipeline
+
+Drie stappen, eenmalig per dataset:
 
 ```bash
+# 1. Download ruwe data van Binance (pas START_DATE / END_DATE aan in script)
 python binance_l2.py
+
+# 2. Feature engineering + z-score normalisatie
+python dataVerwerken/preprocess_data.py
+
+# 3. Train/val/test split (80/10/10)
+python dataVerwerken/create_core_data.py
 ```
 
-## 🧠 Training Workflow
+Na stap 3 staat alle benodigde data in `coreData/`:
+`train.parquet`, `val.parquet`, `test.parquet`, `normalization_stats.json`.
+De tussenproducten in `DataNorm/` kun je daarna weggooien.
 
-### Optie A: DeepLOB + RL (Aanbevolen)
+## Training
 
-**Stap 1: Pre-train DeepLOB** (leert order book patterns herkennen)
+### Stap 1 — Pretrain DeepLOB (supervised)
+
 ```bash
-python train/train_deeplob_pretrain.py --data_dir ./btc_l2_data --epochs 50
+python -m train.train_deeplob_pretrain --max_rows 20000000 --epochs 30
 ```
-Dit traint DeepLOB supervised op price direction prediction en slaat het model op in `./models/deeplob_pretrained.pt`.
 
-**Stap 2: Train SAC of PPO met pre-trained DeepLOB**
+Schrijft model naar `models/deeplob_pretrained.pt`.
+
+### Stap 2 — RL agent met DeepLOB backbone (aanbevolen)
+
 ```bash
-# SAC met pre-trained DeepLOB (fine-tune)
-python train/train_sac_with_deeplob.py --deeplob_model ./models/deeplob_pretrained.pt
-
-# Of PPO met pre-trained DeepLOB
-python train/train_ppo_with_deeplob.py --deeplob_model ./models/deeplob_pretrained.pt
-
-# Optioneel: freeze DeepLOB weights (snellere training)
-python train/train_sac_with_deeplob.py --deeplob_model ./models/deeplob_pretrained.pt --freeze_deeplob
+python -m train.train_ppo_with_deeplob --deeplob_model ./models/deeplob_pretrained.pt --freeze_deeplob
+python -m train.train_sac_with_deeplob --deeplob_model ./models/deeplob_pretrained.pt --freeze_deeplob
 ```
 
-### Optie B: Alleen RL (Simpeler, Sneller)
+### Baseline — RL agent zonder DeepLOB
 
-Train SAC of PPO direct met MLP feature extraction:
 ```bash
-# SAC alleen
-python train/train_sac_only.py --data_dir ./btc_l2_data --total_steps 500000
-
-# PPO alleen
-python train/train_ppo_only.py --data_dir ./btc_l2_data --total_steps 500000
+python -m train.train_ppo_only
+python -m train.train_sac_only
 ```
 
-### 3. Monitor Training
+### Hervatten
+
+Alle training scripts ondersteunen `--resume <pad/naar/resume_checkpoint.pt>`.
+
+## Hyperparameters
+
+Worden bewerkt in de training scripts zelf. Elk script heeft een
+`parse_args()` block met `--learning_rate`, `--gamma`, `--batch_size` etc.;
+die defaults zijn de "ingebakken" hyperparameters. CLI-overrides werken
+voor losse experimenten.
+
+## Evaluatie
+
+```bash
+python evaluate.py --model_path ./logs/<run>/best_model.pt --algo ppo_deeplob \
+                   --deeplob_model ./models/deeplob_pretrained.pt --split test
+```
+
+Algoritmes: `ppo_deeplob`, `sac_deeplob`, `ppo_only`, `sac_only`.
+
+## Monitoring
 
 ```bash
 tensorboard --logdir ./logs
 ```
-Open http://localhost:6006
 
-## 🧠 Model Architecturen
+## Trading environment
 
-### DeepLOB (CNN + LSTM)
-
-DeepLOB is gebaseerd op het paper ["DeepLOB: Deep Convolutional Neural Networks for Limit Order Books"](https://arxiv.org/abs/1808.03668).
-
-```
-Input (sequence_length, features)
-    │
-    ▼
-Conv1D Blocks (feature extraction)
-    │
-    ▼
-Inception Module (multi-scale patterns)
-    │
-    ▼
-Bidirectional LSTM (temporal dependencies)
-    │
-    ▼
-Attention Pooling
-    │
-    ▼
-Output Features
-```
-
-### SAC (Soft Actor-Critic)
-
-Off-policy RL met maximum entropy:
-- **Actor**: Leert stochastisch beleid met entropy bonus
-- **Critic**: Twin Q-networks voor stabiele value estimation
-- **Automatic Temperature**: Automatische α (entropy coefficient) tuning
-
-Voordelen:
-- Sample efficient (replay buffer)
-- Exploration via entropy
-- Stabiele training
-
-### PPO (Proximal Policy Optimization)
-
-On-policy RL met clipped surrogate:
-- **Policy**: Categorische distributie voor discrete acties
-- **Value Network**: Baseline voor advantage estimation
-- **GAE**: Generalized Advantage Estimation
-
-Voordelen:
-- Stabiel en robuust
-- Werkt goed met weinig hyperparameter tuning
-- Goede performance op diverse taken
-
-## ⚙️ Hyperparameters
-
-### SAC Defaults
-| Parameter | Waarde | Beschrijving |
-|-----------|--------|--------------|
-| learning_rate | 3e-4 | Learning rate |
-| gamma | 0.99 | Discount factor |
-| tau | 0.005 | Soft update coefficient |
-| alpha | 0.2 | Entropy coefficient |
-| batch_size | 256 | Batch size |
-
-### PPO Defaults
-| Parameter | Waarde | Beschrijving |
-|-----------|--------|--------------|
-| learning_rate | 3e-4 | Learning rate |
-| gamma | 0.99 | Discount factor |
-| gae_lambda | 0.95 | GAE lambda |
-| clip_epsilon | 0.2 | PPO clipping |
-| n_epochs | 10 | Epochs per update |
-| n_steps | 2048 | Steps per rollout |
-
-## 📊 Trading Environment
-
-De trading environment ondersteunt:
-
-- **Acties**: Buy (0), Sell (1), Hold (2)
-- **Observaties**: 
-  - Order book data (bid/ask prices & volumes)
-  - Technical indicators (RSI, MACD, SMA, EMA, ATR)
-  - Portfolio state (position, balance)
-
-- **Reward**: 
-  - Profit/loss van trades
-  - Sharpe ratio component
-  - Transaction cost penalty
-
-## 📈 Features
-
-- **Data Loading**: Automatisch laden van Parquet files met ZSTD compression
-- **Feature Engineering**: 
-  - Returns, log returns
-  - SMA, EMA (meerdere periodes)
-  - RSI, MACD, ATR
-  - Order flow imbalance
-- **Logging**: 
-  - TensorBoard integratie
-  - CSV exports
-  - Checkpoints
-- **Callbacks**:
-  - Early stopping
-  - Learning rate scheduling
-  - Model checkpointing
-
-## 🔧 Command Line Arguments
-
-Alle training scripts ondersteunen dezelfde basis arguments:
-
-```bash
-python train/train_sac_deeplob.py \
-    --data_dir ./btc_l2_data \    # Data directory
-    --total_steps 1000000 \        # Totaal training steps
-    --batch_size 256 \             # Batch size
-    --learning_rate 3e-4 \         # Learning rate
-    --gamma 0.99 \                 # Discount factor
-    --initial_balance 10000 \      # Start kapitaal
-    --transaction_fee 0.001 \      # Transactie kosten (0.1%)
-    --eval_freq 10000 \            # Evaluatie frequentie
-    --log_dir ./logs \             # Log directory
-    --device auto \                # cuda/cpu/auto
-    --seed 42                      # Random seed
-```
-
-## 📝 Licentie
-
-MIT License
-
-## 🤝 Contributing
-
-Pull requests zijn welkom! Voor grote wijzigingen, open eerst een issue om te bespreken.
+- **Acties (discreet):** Hold = 0, Buy = 1, Sell = 2
+- **Observatie:** `features` (window van market data) + `portfolio` (balans, BTC, PnL)
+- **Reward:** PnL-verandering minus fees; extra penalty bij drawdown > 15%
+- **Episode einde:** data op of bankruptcy (portfolio < 10% van start → reset)

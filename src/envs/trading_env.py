@@ -31,8 +31,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Performance tracking voor logging
-_LOG_TRADE_DETAILS = False  # Zet op True voor verbose trade output
-_LOG_STEP_INTERVAL = 1000  # Log elke N steps (voor DEBUG level)
+_LOG_STEP_INTERVAL = 1000  # Log step diagnostics every N steps at DEBUG level.
 
 
 class CryptoTradingEnv(gym.Env):
@@ -394,20 +393,7 @@ class CryptoTradingEnv(gym.Env):
         self.portfolio_values.append(current_value)
         self.max_portfolio_value = max(self.max_portfolio_value, current_value)
         
-        # =====================================
-        # LOGGING
-        # =====================================
-        # Log trade details voor debugging
-        if _LOG_TRADE_DETAILS and trade_info['executed']:
-            logger.info(
-                f"Trade @ step {self.current_step}: {trade_info['type'].upper()} | "
-                f"Amount: {trade_info['amount']:.6f} BTC | "
-                f"Price: ${trade_info['price']:.2f} | "
-                f"Fee: ${trade_info['fee']:.4f} | "
-                f"Portfolio: ${current_value:.2f}"
-            )
-        
-        # Log periodic step info voor performance tracking
+        # Periodic step diagnostics at DEBUG level.
         if self.current_step % _LOG_STEP_INTERVAL == 0:
             logger.debug(
                 f"Step {self.current_step}: "

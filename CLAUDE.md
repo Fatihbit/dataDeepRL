@@ -1,10 +1,12 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
 ## Project Overview
 
-DataDeepRL is a Deep Reinforcement Learning framework for BTC/USDT cryptocurrency trading using Binance Level 2 (L2) order book data. It combines a DeepLOB (CNN+LSTM) feature extractor with PPO and SAC RL agents.
+DataDeepRL is a Deep RL framework for BTC/USDT trading using Binance L2 order
+book data. It combines a DeepLOB (CNN + Inception + BiLSTM) feature extractor
+with PPO and SAC agents.
 
 ## Setup
 
@@ -12,88 +14,97 @@ DataDeepRL is a Deep Reinforcement Learning framework for BTC/USDT cryptocurrenc
 pip install -r requirements.txt
 ```
 
-## Common Commands
+## Common commands
 
-### Data Pipeline (run in order)
+### Data pipeline (run once per dataset)
+
 ```bash
-python binance_l2.py                          # Download Binance L2 data → btc_l2_data/
-python dataVerwerken/preprocess_data.py       # Feature engineering + normalization → DataNorm/
-python dataVerwerken/create_core_data.py      # Train/val/test split (70/15/15) → coreData/
+python binance_l2.py                          # raw download → btc_l2_data/
+python dataVerwerken/preprocess_data.py       # features + z-score → DataNorm/
+python dataVerwerken/create_core_data.py      # 80/10/10 split → coreData/
 ```
 
-### Training
+After `create_core_data.py`, only `coreData/` is needed for training.
+`DataNorm/` is intermediate scratch and can be deleted.
+
+### Training (all use coreData/)
+
 ```bash
-# Step 1: Pre-train DeepLOB (supervised, price direction prediction)
-python train/train_deeplob_pretrain.py --data_dir btc_l2_data --epochs 50
+# Step 1: Pretrain DeepLOB (supervised, price direction)
+python -m train.train_deeplob_pretrain --max_rows 20000000 --epochs 30
 
-# Step 2: Train RL agent with frozen pre-trained DeepLOB (recommended)
-python train/train_ppo_with_deeplob.py --deeplob_model models/deeplob_pretrained.pt --freeze_deeplob --total_steps 500000
-python train/train_sac_with_deeplob.py --deeplob_model models/deeplob_pretrained.pt --freeze_deeplob --total_steps 500000
+# Step 2: RL agent with frozen pretrained DeepLOB (recommended)
+python -m train.train_ppo_with_deeplob --deeplob_model ./models/deeplob_pretrained.pt --freeze_deeplob
+python -m train.train_sac_with_deeplob --deeplob_model ./models/deeplob_pretrained.pt --freeze_deeplob
 
-# Baseline (no DeepLOB, MLP only)
-python train/train_ppo_only.py --total_steps 100000
-python train/train_sac_only.py --total_steps 100000
+# MLP baseline (no DeepLOB)
+python -m train.train_ppo_only
+python -m train.train_sac_only
 ```
 
-### Monitoring
+### Monitoring & evaluation
+
 ```bash
-tensorboard --logdir logs/
-mlflow ui --backend-store-uri logs/mlruns
+tensorboard --logdir ./logs
+python evaluate.py --model_path logs/<run>/best_model.pt --algo ppo_deeplob \
+                   --deeplob_model models/deeplob_pretrained.pt --split test
 ```
 
 ## Architecture
 
-### Data Flow
+### Data flow
+
 ```
-Binance L2 parquet → BTCDataLoader → CryptoTradingEnv → RL Agent → Action → Reward
+coreData/{train,val,test}.parquet
+   → load_coredata_streaming()  (raw features + denormalised prices)
+   → CryptoTradingEnv           (sliding windows on-the-fly, zero-copy)
+   → RL agent                   (PPO or SAC, optionally with DeepLOB backbone)
 ```
 
-### Key Components
+Training data is **pre-normalized** in `coreData/`. The env streams raw
+features (N × num_features) and creates windowed sequences on demand via
+numpy slicing — avoids materialising a (N × seq_len × num_features) array.
+Prices are denormalized back to USD by the loader (using `normalization_stats.json`).
 
-**`src/data/dataloader.py` — BTCDataLoader**
-- Loads parquet files, engineers features (returns, SMA/EMA, RSI, MACD, ATR, bid/ask spread, order flow imbalance)
-- Applies StandardScaler or MinMaxScaler normalization
-- Chronological train/val/test split
+### Key components
 
 **`src/envs/trading_env.py` — CryptoTradingEnv**
-- Gymnasium-compatible environment
-- Discrete actions: Hold=0, Buy=1, Sell=2 (or continuous -1 to +1)
-- Dict observation: `features` (window of market data) + `portfolio` state
-- Reward: portfolio PnL change minus transaction fee penalty; extra penalty when drawdown > 10%
-- Episode ends at data exhaustion; bankruptcy (balance < 10% of initial) resets balance to initial_balance
+- Gymnasium-compatible. Dict obs (`features`, `portfolio`).
+- Actions: Hold = 0, Buy = 1, Sell = 2 (discrete) or Box(-1, 1) continuous.
+- Reward: portfolio PnL change minus fees, extra penalty when drawdown > 15%.
+- `FlatCryptoTradingEnv` is the same env with a flat observation for MLP agents.
+
+**`src/envs/vec_env.py` — VectorizedTradingEnv**
+- Runs N parallel envs in subprocesses for sample throughput.
 
 **`src/models/deeplob.py` — DeepLOB**
-- Feature extractor implementing Zhang et al. (2019) "DeepLOB" paper
-- Pipeline: Conv1D blocks → Inception module (1×1, 3×3, 5×5 kernels) → BiLSTM → Attention pooling → FC output
-- Input: `(batch, window_size, input_dim)` e.g. `(32, 100, 20)` → Output: `(batch, 64)`
-- Used as a frozen backbone after supervised pre-training
+- Zhang et al. (2019) DeepLOB: Conv1D → Inception (1×1, 3×3, 5×5) → BiLSTM
+  → attention pooling. Used as frozen backbone after supervised pretraining.
 
-**`src/models/ppo.py` — PPO Agent**
-- On-policy; uses RolloutBuffer, GAE, clipped objective
-- Policy network outputs Categorical distribution over discrete actions
-- Default: lr=1e-4, gamma=0.99, gae_lambda=0.95, clip_epsilon=0.2
+**`src/models/ppo.py` — PPOAgent, `src/models/sac.py` — SACAgent**
+- MLP-based agents (used by `train_*_only.py`).
 
-**`src/models/sac.py` — SAC Agent**
-- Off-policy; uses ReplayBuffer (1M), twin Q-networks, auto-tuned temperature α
-- Actor outputs Normal distribution (stochastic policy)
-- Default: lr=3e-4, gamma=0.99, tau=0.005, alpha=0.2
+**`train/train_ppo_with_deeplob.py` and `train_sac_with_deeplob.py`**
+- Contain their own `PPOWithPretrainedDeepLOB` / `SACWithPretrainedDeepLOB`
+  classes (PPO/SAC algorithm + DeepLOB backbone + portfolio encoder).
+- Core algorithm code overlaps with `src/models/{ppo,sac}.py` but the two
+  variants are intentionally kept separate.
 
-**`src/models/mlp.py`** — Baseline MLP feature extractor (linear + LayerNorm + LeakyReLU), used in `*_only` training scripts.
+**`train/common/setup.py`**
+- `load_coredata_streaming()` — memory-efficient data loader.
+- `STATIONARY_FEATURES` — list of feature columns used as model input.
 
-**`src/utils/`**
-- `logger.py`: TrainingLogger with TensorBoard, MLflow, and CSV export
-- `callbacks.py`: CheckpointCallback, EvalCallback, EarlyStoppingCallback, LearningRateScheduler, ProgressCallback
-- `mixed_precision.py`: AMP (Automatic Mixed Precision) support
-- `trade_logger.py`: Per-trade metrics logging
+## Hyperparameters
 
-### Training Paradigms
-1. **Supervised pre-training**: DeepLOB trained on price-direction labels
-2. **Transfer learning (recommended)**: Frozen pre-trained DeepLOB as backbone for RL agent
-3. **End-to-end RL**: MLP baseline without DeepLOB (faster iteration, lower performance)
+Edited inline in each training script's `parse_args()` defaults. The model
+classes (e.g. `PPOAgent.__init__`) also carry sensible defaults. There is no
+external tuning framework — tune by editing the script you are running.
 
-### Configuration
-`configs/default.yaml` — Central hyperparameter config:
-- `window_size: 100`, `sequence_length: 100`
-- `initial_balance: 100000`, `transaction_fee: 0.0`, `flat_fee: 1.0`
-- `total_steps: 1000000`, `device: auto`
-- `eval_freq: 10000`, `log_dir: ./logs`
+## Notes
+
+- Always reach training via `python -m train.<script>` (module form) so
+  `from train.common.setup import ...` resolves.
+- After `coreData/` exists, you do not need `btc_l2_data/` or `DataNorm/` for
+  training.
+- `normalization_stats.json` in `coreData/` is required at training time —
+  the env uses it to denormalize the price column back to USD.

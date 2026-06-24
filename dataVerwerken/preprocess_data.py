@@ -237,7 +237,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         for period in [5, 10, 30, 60]:
             df[f'return_{period}s'] = df['close'].pct_change(period)
     
-    # 2. Moving averages
+    # 2. Moving averages Exponential Moving Average (EMA). Simple Moving Average (SMA)
     if 'close' in df.columns:
         for window in [10, 30, 60]:
             df[f'sma_{window}'] = df['close'].rolling(window).mean()
@@ -248,7 +248,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         for window in [10, 30, 60]:
             df[f'volatility_{window}'] = df['return_1s'].rolling(window).std()
     
-    # 4. Momentum & RSI
+    # 4. Momentum & RSI RSI (Relative Strength Index)
     if 'close' in df.columns:
         df['momentum_10'] = df['close'] - df['close'].shift(10)
         df['momentum_30'] = df['close'] - df['close'].shift(30)

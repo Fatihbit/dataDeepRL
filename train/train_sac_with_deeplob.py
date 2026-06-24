@@ -76,14 +76,13 @@ import torch.nn.functional as F
 # Voeg src toe aan path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.dataloader import BTCDataLoader
 from src.envs.trading_env import CryptoTradingEnv
 from src.envs.vec_env import VectorizedTradingEnv
 from src.models.deeplob import DeepLOB
 from src.models.sac import ReplayBuffer
 from src.utils.logger import TrainingLogger, setup_logging
 from src.utils.trade_logger import TradeLogger
-from train.common.setup import load_coredata, load_coredata_streaming
+from train.common.setup import load_coredata_streaming
 
 warnings.filterwarnings('ignore')
 
@@ -894,84 +893,45 @@ def main():
     # DATA
     # =====================================
     print("Loading data...")
-    is_coredata = os.path.exists(os.path.join(args.data_dir, 'train.parquet'))
-    
-    if is_coredata:
-        train_features, train_prices, val_features, val_prices, _, _ = load_coredata_streaming(
-            data_dir=args.data_dir,
-            sequence_length=sequence_length,
-            max_rows=args.max_rows
+    train_features, train_prices, val_features, val_prices, _, _ = load_coredata_streaming(
+        data_dir=args.data_dir,
+        sequence_length=sequence_length,
+        max_rows=args.max_rows,
+    )
+    expected_dim = deeplob_config['input_dim']
+    actual_dim = train_features.shape[1]
+    if actual_dim != expected_dim:
+        raise ValueError(
+            f"Feature mismatch: coreData has {actual_dim} features but "
+            f"DeepLOB checkpoint expects input_dim={expected_dim}. "
+            f"Re-train DeepLOB with matching features or adjust data."
         )
-        # Validate feature dim matches DeepLOB checkpoint
-        expected_dim = deeplob_config['input_dim']
-        actual_dim = train_features.shape[1]
-        if actual_dim != expected_dim:
-            raise ValueError(
-                f"Feature mismatch: coreData has {actual_dim} features but "
-                f"DeepLOB checkpoint expects input_dim={expected_dim}. "
-                f"Re-train DeepLOB with matching features or adjust data."
-            )
-    else:
-        data_loader = BTCDataLoader(
-            window_size=sequence_length,
-            data_dir=args.data_dir
-        )
-        df = data_loader.load_data(max_files=args.max_files)
-        if df is None or len(df) == 0:
-            print("Error: Could not load data!")
-            return
-        df = data_loader.create_features()
-        sequences, targets, prices = data_loader.prepare_sequences(df)
-        train_data, val_data, _ = data_loader.split_data(sequences, targets, prices)
-        train_sequences, _, train_prices = train_data
-        val_sequences, _, val_prices = val_data
-        train_features, val_features = None, None
-    
     print(f"Train: {len(train_prices):,}, Val: {len(val_prices):,}")
-    
+
     # =====================================
     # ENVIRONMENTS
     # =====================================
     num_envs = args.num_envs
-    if train_features is not None:
-        train_env_kwargs = dict(
-            raw_features=train_features,
-            prices=train_prices,
-            window_size=sequence_length,
-            initial_balance=args.initial_balance,
-            transaction_fee=args.transaction_fee,
-            flat_fee=args.flat_fee,
-            max_episode_steps=args.max_episode_steps,
-            random_start=True,
-            random_start_range=1.0
-        )
-        eval_env = CryptoTradingEnv(
-            raw_features=val_features,
-            prices=val_prices,
-            window_size=sequence_length,
-            initial_balance=args.initial_balance,
-            transaction_fee=args.transaction_fee,
-            flat_fee=args.flat_fee
-        )
-    else:
-        train_env_kwargs = dict(
-            sequences=train_sequences,
-            prices=train_prices,
-            initial_balance=args.initial_balance,
-            transaction_fee=args.transaction_fee,
-            flat_fee=args.flat_fee,
-            max_episode_steps=args.max_episode_steps,
-            random_start=True,
-            random_start_range=1.0
-        )
-        eval_env = CryptoTradingEnv(
-            sequences=val_sequences,
-            prices=val_prices,
-            initial_balance=args.initial_balance,
-            transaction_fee=args.transaction_fee,
-            flat_fee=args.flat_fee
-        )
-    
+    train_env_kwargs = dict(
+        raw_features=train_features,
+        prices=train_prices,
+        window_size=sequence_length,
+        initial_balance=args.initial_balance,
+        transaction_fee=args.transaction_fee,
+        flat_fee=args.flat_fee,
+        max_episode_steps=args.max_episode_steps,
+        random_start=True,
+        random_start_range=1.0,
+    )
+    eval_env = CryptoTradingEnv(
+        raw_features=val_features,
+        prices=val_prices,
+        window_size=sequence_length,
+        initial_balance=args.initial_balance,
+        transaction_fee=args.transaction_fee,
+        flat_fee=args.flat_fee,
+    )
+
     train_vec_env = VectorizedTradingEnv(
         num_envs=num_envs,
         env_kwargs=train_env_kwargs,
@@ -1026,6 +986,9 @@ def main():
     total_fees_paid = 0.0
     max_drawdowns = []
     last_eval_composite = 0.0
+    last_eval_sharpe = 0.0
+    last_eval_return = 0.0
+    last_eval_drawdown = 0.0
 
     save_dir = os.path.join(args.log_dir, args.experiment_name)
     os.makedirs(save_dir, exist_ok=True)
@@ -1045,7 +1008,8 @@ def main():
                     'total_trades,buys,sells,winning_sells,losing_sells,win_pct,'
                     'total_profit,total_loss,net_pnl,total_fees,'
                     'avg_buy_size,avg_sell_size,avg_profit_per_win,avg_loss_per_loss,'
-                    'trade_freq,critic_loss,actor_loss,eval_composite_score\n')
+                    'trade_freq,critic_loss,actor_loss,eval_composite_score,'
+                    'eval_sharpe,eval_return,eval_drawdown\n')
     
     # Per-trade logger
     trade_logger = TradeLogger(save_dir)
@@ -1318,6 +1282,9 @@ def main():
                              + 0.5 * np.clip(i.get('total_return', 0.0), -1, 1)
                              - 0.2 * i.get('max_drawdown', 0.0) for i in eval_infos]
                 last_eval_composite = float(np.mean(_c_scores)) if _c_scores else 0.0
+                last_eval_sharpe = float(np.mean([i.get('sharpe_ratio', 0.0) for i in eval_infos])) if eval_infos else 0.0
+                last_eval_return = float(np.mean([i.get('total_return', 0.0) for i in eval_infos])) if eval_infos else 0.0
+                last_eval_drawdown = float(np.mean([i.get('max_drawdown', 0.0) for i in eval_infos])) if eval_infos else 0.0
 
                 mean_eval = np.mean(eval_rewards)
                 logger.log_evaluation(step, eval_rewards)
@@ -1395,7 +1362,8 @@ def main():
                                 f"{ts['total_profit']:.2f},{ts['total_loss']:.2f},{ts['net_pnl']:.2f},{ts['total_fees']:.2f},"
                                 f"{ts['avg_buy_size_usd']:.2f},{ts['avg_sell_size_usd']:.2f},"
                                 f"{ts['avg_profit_per_win']:.2f},{ts['avg_loss_per_loss']:.2f},"
-                                f"{trade_freq:.6f},{last_cl:.6f},{last_al:.6f},{last_eval_composite:.6f}\n")
+                                f"{trade_freq:.6f},{last_cl:.6f},{last_al:.6f},{last_eval_composite:.6f},"
+                                f"{last_eval_sharpe:.6f},{last_eval_return:.6f},{last_eval_drawdown:.6f}\n")
                 except Exception as e:
                     print(f"  [WARN] Could not write monitor CSV: {e}")
 

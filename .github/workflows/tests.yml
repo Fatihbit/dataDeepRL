@@ -1,0 +1,47 @@
+name: Tests & Coverage
+
+# Ontwikkelstraat (CI): draait de geautomatiseerde testsuite bij elke push en
+# pull request naar main. Faalt de build als ook maar één test faalt.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:        # handmatig startbaar vanuit de GitHub UI
+
+jobs:
+  test:
+    name: Unit / acceptatie / non-functioneel + coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Lichte set die de tests nodig hebben (geen zware training-stack).
+          pip install numpy pandas gymnasium torch --index-url https://download.pytorch.org/whl/cpu || pip install numpy pandas gymnasium torch
+          pip install coverage
+
+      - name: Run test suite + generate report
+        run: python -m tests.run_tests
+
+      - name: Upload test report
+        if: always()           # ook uploaden als tests falen
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: tests/TEST_REPORT.md
+
+      - name: Coverage summary in job log
+        if: always()
+        run: coverage report || true

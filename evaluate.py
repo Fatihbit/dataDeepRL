@@ -297,6 +297,12 @@ def run_evaluation(agent, algo, env, n_episodes, trade_logger, args):
         peak = np.maximum.accumulate(pv_arr)
         drawdowns = (peak - pv_arr) / np.maximum(peak, 1e-8)
         max_dd_computed = float(drawdowns.max()) if len(drawdowns) > 0 else 0.0
+        ep_drawdown = max(max_drawdown, max_dd_computed)
+
+        # Composite score — zelfde formule als tijdens training (vergelijkbaar)
+        composite_score = (0.5 * np.clip(sharpe, -5, 5) / 5
+                           + 0.5 * np.clip(total_return, -1, 1)
+                           - 0.2 * ep_drawdown)
 
         ep_result = {
             'episode': ep_i,
@@ -313,8 +319,9 @@ def run_evaluation(agent, algo, env, n_episodes, trade_logger, args):
             'sells': ep_sells,
             'holds': ep_holds,
             'fees': round(ep_fees, 4),
-            'max_drawdown': round(max(max_drawdown, max_dd_computed), 4),
+            'max_drawdown': round(ep_drawdown, 4),
             'sharpe_ratio': round(sharpe, 4),
+            'composite_score': round(float(composite_score), 6),
             'avg_reward_per_step': round(ep_reward / max(ep_steps, 1), 6),
             'final_balance': round(info.get('balance', 0), 2),
             'final_btc_held': round(info.get('btc_held', 0), 8),
@@ -329,6 +336,31 @@ def run_evaluation(agent, algo, env, n_episodes, trade_logger, args):
               f"DD={max(max_drawdown, max_dd_computed)*100:.1f}% | [{status}]")
 
     return episodes, progress_log
+
+
+def compute_buy_and_hold(prices, sequence_length, initial_balance, max_steps):
+    """Bereken buy-and-hold return over dezelfde periode als de agent evalueerde."""
+    start_idx = sequence_length
+    end_idx = len(prices) - 1
+    if max_steps > 0:
+        end_idx = min(start_idx + max_steps, end_idx)
+
+    start_price = prices[start_idx]
+    end_price = prices[end_idx]
+    btc_bought = initial_balance / start_price
+    final_value = btc_bought * end_price
+    pnl = final_value - initial_balance
+    return_pct = (end_price - start_price) / start_price * 100
+
+    return {
+        'start_price': round(float(start_price), 2),
+        'end_price': round(float(end_price), 2),
+        'btc_bought': round(float(btc_bought), 8),
+        'final_value': round(float(final_value), 2),
+        'pnl': round(float(pnl), 2),
+        'return_pct': round(float(return_pct), 4),
+        'n_steps': end_idx - start_idx,
+    }
 
 
 def compute_summary(episodes, args):
@@ -346,11 +378,16 @@ def compute_summary(episodes, args):
     trades = [e['total_trades'] for e in episodes]
     drawdowns = [e['max_drawdown'] for e in episodes]
     sharpes = [e['sharpe_ratio'] for e in episodes]
+    composites = [e['composite_score'] for e in episodes]
     fees = [e['fees'] for e in episodes]
 
     profitable_episodes = sum(1 for p in pnls if p > 0)
     total_fees = float(np.sum(fees))
     total_gross = float(np.sum(gross_pnls))
+
+    # Totaal winst en totaal verlies gesplitst
+    total_profit = float(np.sum([p for p in pnls if p > 0]))
+    total_loss = float(np.sum([abs(p) for p in pnls if p < 0]))
 
     return {
         'n_episodes': n,
@@ -370,6 +407,8 @@ def compute_summary(episodes, args):
         'min_pnl': round(float(np.min(pnls)), 2),
         'max_pnl': round(float(np.max(pnls)), 2),
         'fee_impact_pct': round(total_fees / total_gross * 100, 2) if total_gross > 0 else 0.0,
+        'total_profit': round(total_profit, 2),
+        'total_loss': round(total_loss, 2),
         # Returns
         'avg_return_pct': round(float(np.mean(returns)), 4),
         'median_return_pct': round(float(np.median(returns)), 4),
@@ -392,10 +431,11 @@ def compute_summary(episodes, args):
         'avg_max_drawdown': round(float(np.mean(drawdowns)), 4),
         'worst_drawdown': round(float(np.max(drawdowns)), 4),
         'avg_sharpe': round(float(np.mean(sharpes)), 4),
+        'avg_composite_score': round(float(np.mean(composites)), 6),
     }
 
 
-def save_results(output_dir, episodes, summary, trade_logger, args, algo, elapsed, progress_log=None):
+def save_results(output_dir, episodes, summary, trade_logger, args, algo, elapsed, progress_log=None, bah=None):
     """Save all evaluation results to files."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -415,6 +455,7 @@ def save_results(output_dir, episodes, summary, trade_logger, args, algo, elapse
             'device': args.device,
         },
         'results': summary,
+        'buy_and_hold': bah,
         'per_episode': episodes,
     }
     summary_path = os.path.join(output_dir, 'eval_summary.json')
@@ -528,6 +569,19 @@ def save_results(output_dir, episodes, summary, trade_logger, args, algo, elapse
         f.write(f"Avg Max Drawdown:     {s['avg_max_drawdown']*100:.2f}%\n")
         f.write(f"Worst Drawdown:       {s['worst_drawdown']*100:.2f}%\n")
         f.write(f"Avg Sharpe Ratio:     {s['avg_sharpe']:.3f}\n")
+        f.write(f"Avg Composite Score:  {s['avg_composite_score']:.4f}\n")
+        f.write(f"\n--- Totaal Winst / Verlies ---\n")
+        f.write(f"Totaal Winst:         ${s['total_profit']:+,.2f}\n")
+        f.write(f"Totaal Verlies:       ${s['total_loss']:,.2f}\n")
+        f.write(f"Netto PnL:            ${s['total_pnl']:+,.2f}\n")
+        if bah:
+            f.write(f"\n--- Buy-and-Hold Benchmark ---\n")
+            f.write(f"BTC prijs begin:      ${bah['start_price']:,.2f}\n")
+            f.write(f"BTC prijs eind:       ${bah['end_price']:,.2f}\n")
+            f.write(f"BTC return:           {bah['return_pct']:+.2f}%\n")
+            f.write(f"BTC PnL:              ${bah['pnl']:+,.2f}\n")
+            f.write(f"Agent vs B&H:         {s['avg_return_pct'] - bah['return_pct']:+.2f}% "
+                    f"({'beter' if s['avg_return_pct'] > bah['return_pct'] else 'slechter'})\n")
         f.write(f"\n--- Rewards ---\n")
         f.write(f"Avg Episode Reward:   {s['avg_reward']:.2f}\n")
         f.write(f"Std Episode Reward:   {s['std_reward']:.2f}\n")
@@ -703,6 +757,7 @@ def main():
     # COMPUTE & SAVE RESULTS
     # ==========================================
     summary = compute_summary(episodes, args)
+    bah = compute_buy_and_hold(eval_prices, sequence_length, args.initial_balance, args.max_steps)
 
     print(f"\n{'='*60}")
     print(f"RESULTS ({args.n_episodes} episodes on {args.split} data)")
@@ -710,6 +765,8 @@ def main():
     print(f"  Avg Portfolio Value:  ${summary['avg_portfolio_value']:,.2f}")
     print(f"  Avg Gross PnL (no fee): ${summary['avg_gross_pnl']:+,.2f}")
     print(f"  Avg Net PnL (w/ fee):   ${summary['avg_pnl']:+,.2f}")
+    print(f"  Totaal Winst:         ${summary['total_profit']:+,.2f}")
+    print(f"  Totaal Verlies:       ${summary['total_loss']:,.2f}")
     print(f"  Total Fees:          ${summary['total_fees']:,.2f} ({summary['fee_impact_pct']:.1f}% of gross)")
     print(f"  Avg Return:          {summary['avg_return_pct']:+.2f}%")
     print(f"  Episode Win Rate:    {summary['episode_win_rate']*100:.0f}% "
@@ -717,12 +774,18 @@ def main():
     print(f"  Avg Trade Win Rate:  {summary['avg_win_rate']*100:.1f}%")
     print(f"  Avg Max Drawdown:    {summary['avg_max_drawdown']*100:.2f}%")
     print(f"  Avg Sharpe:          {summary['avg_sharpe']:.3f}")
+    print(f"  Avg Composite Score: {summary['avg_composite_score']:.4f}")
     print(f"  Avg Trades/Episode:  {summary['avg_trades']:.1f}")
     print(f"  Duration:            {elapsed:.1f}s")
+    print(f"\n--- Buy-and-Hold Benchmark ---")
+    print(f"  BTC begin: ${bah['start_price']:,.2f}  →  eind: ${bah['end_price']:,.2f}")
+    print(f"  B&H Return:  {bah['return_pct']:+.2f}%  |  B&H PnL: ${bah['pnl']:+,.2f}")
+    diff = summary['avg_return_pct'] - bah['return_pct']
+    print(f"  Agent vs B&H: {diff:+.2f}% ({'beter' if diff > 0 else 'slechter'})")
 
     summary_path, csv_path, txt_path = save_results(
         output_dir, episodes, summary, trade_logger, args, algo, elapsed,
-        progress_log=progress_log
+        progress_log=progress_log, bah=bah
     )
 
     print(f"\nResults saved to: {output_dir}")
